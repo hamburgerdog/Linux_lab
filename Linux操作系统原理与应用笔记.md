@@ -188,7 +188,7 @@ Linux中每一个进程都有自己的页目录和页表集，当进程发生切
       //  0x1000000=16MB 初始化了四个页表，每个页表映射了4MB的物理内存地址
       while (phy_add < 0x1000000) 
       {
-          * pgt_entry = phy_add |PTE_USR|PTE_RW|PTE_PRE;  //  页表项与物理内存真正形成映射
+          * pgt_entry = phy_add |PTE_USR|PTE_RW|PTE_PRE;  //  页面与物理内存真正形成映射
           phy_add += 0x1000;      												//  物理块大小和页面大小都是4KB
       }
 
@@ -204,6 +204,271 @@ Linux中每一个进程都有自己的页目录和页表集，当进程发生切
 
 
 ## 第三章 进程
+
+### linux系统中的进程控制块
+
+linux中对进程的描述结构叫做PCB（task_struct）其是一个相当庞大的结构体，按功能可以分成以下几类
+
+1. 状态信息-描述进程的动态变化
+2. 链接信息-描述进的亲属关系
+3. 各种标识符
+4. 进程间通信信息
+5. 时间和定时器信息
+6. 调度信息
+7. 文件系统信息
+8. 虚拟内存信息-描述进程编译连接后形成的地址空间
+9. 处理器环境信息-进程的执行环境（处理器的各种寄存器及堆栈信息），==体现进程动态变化最主要的场景==
+
+系统创建一个新进程的时候就是在内核中为它建立了一个PCB，进程结束的时候又收回PCB，其是内核中频繁读写的数据结构，因此应当常驻内存。
+
+每当进程从用户态进入内核态后都要使用栈-进程的内核栈，进程一进入内核态，CPU就自动为其设置该进程的内核栈，这个栈位于**内核的数据段**上，其==*内核栈和一个`thread_info`结构存放在一起，大小为8KB*==。实际上内核为PCB分配空间的方式是动态的（**确切地说，内核根本不为PCB分配内存**），而仅仅给内核栈分配8KB的内存，并把一部分让给PCB使用(thread_info)。
+
+段起始于末端，并朝这个内存区开始的方向增长，从用户态转到内核态以后，<u>进程的内核栈总是空的</u>，堆栈寄存器ESP直接指向内存区的顶端，只要把数据写入栈中，ESP的值递减。`thread_info`与内核栈存放在一起的最大好处是，内存栈很容易从`ESP`的值获取到当前CPU上运行的`thread_info`结构的地址，因为`thread_union`(内核栈和thread_info)结构的长度是8KB，**则内核屏蔽ESP的低13位就得到thread_info结构的基地址**，通过`*task`就可以得到该进程的PCB，`PCB`和`thread_info`都有一个域是指向对方的，是一种一一对应的关系，而再定义一个`thread_info`结构的原因有两种可能：1.该结构是最频繁被调用的 2.随着linux版本的变化，PCB越来越大，为了节省内核栈的空间，需要把一部分的PCB内容移出内核栈，只保留最频繁被使用的`thread_info` 
+
+### linux中进程的组织方式
+
+内核建立了几个进程链表，双向循环链表的头尾都是`init_task`（0号进程的PCB，是预先由编译器静态分配到内核数据段的，在运行过程中保持不变，永远不会被撤销的），系统使用哈希表和链地址法来加速用PID找到相应PCB的过程，并组织好了一个就绪队列和等待队列
+
+* 就绪队列存放处于就绪态和运行态的进程
+
+* 等待队列存放睡眠进程，对中断处理、进程同步和定时用处很大
+
+  ```c
+  //	等待队列的数据结构
+  struct __wait_queue{
+    unsigned init flages;	//	区分互斥进程和非互斥进程，对于互斥进程值为（WQ_FLAG_EXCLUSIVE）
+    #define WQ_FLAG_EXCLUSIVE 	0x01	
+    void * private;							//	传递给func的参数
+    wait_queue_func_t func;			//	用于唤醒进程的函数，需要根据等待的原因归类
+    struct list_head task_list;	//	用于组成等待队列
+  };
+  typedef struct __wait_queue wait_queue_t;
+  
+  //	等待队列头结构
+  /*
+  *	等待队列是由中断处理程序和主要内核函数修改的,因此必须对其双向链表保护,以免对其进行同时访问
+  *	所以采用了自旋锁来进行同步
+  */
+  struct __wait_queue_head{
+    spinlock_t lock;
+    struct list_head task_list;
+  }
+  ```
+
+  等待队列是由中断处理程序和主要内核函数修改的，因此必须对其双向链表保护，以免对其进行同时访问，所以采用了自旋锁来进行同步
+
+  等待队列的操作`add_wait_queue()`把一个非互斥进程插入到等待队列链表的第一个位置，`add_wait_queue_exclusive()`把一个互斥进程插入但等待队列的最后一个位置。让某一个进程去睡眠的最基本操作为：先把当前进程的状态设置成`TASK_UNINTERRUPTIBLE`并把它插入到特定的等待队列中，然后调用调度程序，当进程被唤醒的时候会接着执行剩余的指令，同时把进程从等待队列中删除
+
+  ```c
+  //	wake_up()函数
+  void wake_up(wait_queue_head_t){
+    struct list_head *tmp;
+    wait_queue_t *curr;
+    //	扫描链表，找等待队列中的所有进程
+    list_for_each(tmp,&q->task_list){
+      //	curr指向每个等待进程的起始地址
+      curr=list_entry(tmp,wait_queue_t,task_list);
+      /*如果进程已经被唤醒并且进程是互斥的，则循环结束
+       *因为所有的非互斥进程都是在链表的开始位置，而所有的互斥进程都在链表的尾部，所以可以先唤醒非互斥			 *进程再唤醒互斥进程
+       */
+      if(curr->func(curr,TASK_INTERRUPTIBLE|TASK_UNINTERRUPTIBLE,0,NULL)&&curr->flags)
+        break;
+    }
+  }
+  ```
+
+### linux进程调度
+
+linux进程调度是时机：
+
+	1. 进程状态转换的时刻，使用`sleep_on()`、`exit()`时会主动调用调度函数
+ 	2. 当前进程的时间片用完
+ 	3. 设备驱动程序运行时
+ 	4. 从内核态返回到用户态时，从系统调用返回意味着离开内核态，状态转换需要花费一定的时间，在返回到用户态前，系统把在内核态该处理的事应当全部做完。
+
+```c
+//	schedule() 函数主框架 
+static void __sched notrace __schedule(bool preempt)
+{
+    struct task_struct *prev, *next;
+    unsigned long *switch_count;
+    struct rq *rq;
+    int cpu;
+
+    /*  ==1==  
+        找到当前cpu上的就绪队列rq
+        并将正在运行的进程curr保存到prev中  */
+    cpu = smp_processor_id();
+    rq = cpu_rq(cpu);
+    prev = rq->curr;
+
+    /*
+     * do_exit() calls schedule() with preemption disabled as an exception;
+     * however we must fix that up, otherwise the next task will see an
+     * inconsistent (higher) preempt count.
+     *
+     * It also avoids the below schedule_debug() test from complaining
+     * about this.
+     */
+    if (unlikely(prev->state == TASK_DEAD))
+        preempt_enable_no_resched_notrace();
+
+    /*  如果禁止内核抢占，而又调用了cond_resched就会出错
+     *  这里就是用来捕获该错误的  */
+    schedule_debug(prev);
+
+    if (sched_feat(HRTICK))
+        hrtick_clear(rq);
+
+    /*  关闭本地中断  */
+    local_irq_disable();
+
+    /*  更新全局状态，
+     *  标识当前CPU发生上下文的切换  */
+    rcu_note_context_switch();
+
+    /*
+     * Make sure that signal_pending_state()->signal_pending() below
+     * can't be reordered with __set_current_state(TASK_INTERRUPTIBLE)
+     * done by the caller to avoid the race with signal_wake_up().
+     */
+    smp_mb__before_spinlock();
+    /*  锁住该队列  */
+    raw_spin_lock(&rq->lock);
+    lockdep_pin_lock(&rq->lock);
+
+    rq->clock_skip_update <<= 1; /* promote REQ to ACT */
+
+    /*  切换次数记录, 默认认为非主动调度计数(抢占)  */
+    switch_count = &prev->nivcsw;
+
+    /*
+     *  scheduler检查prev的状态state和内核抢占表示
+     *  如果prev是不可运行的, 并且在内核态没有被抢占
+     *  
+     *  此时当前进程不是处于运行态, 并且不是被抢占
+     *  此时不能只检查抢占计数
+     *  因为可能某个进程(如网卡轮询)直接调用了schedule
+     *  如果不判断prev->stat就可能误认为task进程为RUNNING状态
+     *  到达这里，有两种可能，一种是主动schedule, 另外一种是被抢占
+     *  被抢占有两种情况, 一种是时间片到点, 一种是时间片没到点
+     *  时间片到点后, 主要是置当前进程的need_resched标志
+     *  接下来在时钟中断结束后, 会preempt_schedule_irq抢占调度
+     *  
+     *  那么我们正常应该做的是应该将进程prev从就绪队列rq中删除, 
+     *  但是如果当前进程prev有非阻塞等待信号, 
+     *  并且它的状态是TASK_INTERRUPTIBLE
+     *  我们就不应该从就绪队列总删除它 
+     *  而是配置其状态为TASK_RUNNING, 并且把他留在rq中
+
+    /*  如果内核态没有被抢占, 并且内核抢占有效
+        即是否同时满足以下条件：
+        1  该进程处于停止状态
+        2  该进程没有在内核态被抢占 */
+    if (!preempt && prev->state)
+    {
+
+        /*  如果当前进程有非阻塞等待信号，并且它的状态是TASK_INTERRUPTIBLE  */
+        if (unlikely(signal_pending_state(prev->state, prev)))
+        {
+            /*  将当前进程的状态设为：TASK_RUNNING  */
+            prev->state = TASK_RUNNING;
+        }
+        else   /*  否则需要将prev进程从就绪队列中删除*/
+        {
+            /*  将当前进程从runqueue(运行队列)中删除  */
+            deactivate_task(rq, prev, DEQUEUE_SLEEP);
+
+            /*  标识当前进程不在runqueue中  */
+            prev->on_rq = 0;
+
+            /*
+             * If a worker went to sleep, notify and ask workqueue
+             * whether it wants to wake up a task to maintain
+             * concurrency.
+             */
+            if (prev->flags & PF_WQ_WORKER) {
+                struct task_struct *to_wakeup;
+
+                to_wakeup = wq_worker_sleeping(prev);
+                if (to_wakeup)
+                    try_to_wake_up_local(to_wakeup);
+            }
+        }
+        /*  如果不是被抢占的，就累加主动切换次数  */
+        switch_count = &prev->nvcsw;
+    }
+
+    /*  如果prev进程仍然在就绪队列上没有被删除  */
+    if (task_on_rq_queued(prev))
+        update_rq_clock(rq);  /*  跟新就绪队列的时钟  */
+
+    /*  挑选一个优先级最高的任务将其排进队列  */
+    next = pick_next_task(rq, prev);
+    /*  清除pre的TIF_NEED_RESCHED标志  */
+    clear_tsk_need_resched(prev);
+    /*  清楚内核抢占标识  */
+    clear_preempt_need_resched();
+
+    rq->clock_skip_update = 0;
+
+    /*  如果prev和next非同一个进程  */
+    if (likely(prev != next))
+    {
+        rq->nr_switches++;  /*  队列切换次数更新  */
+        rq->curr = next;    /*  将next标记为队列的curr进程  */
+        ++*switch_count;    /* 进程切换次数更新  */
+
+        trace_sched_switch(preempt, prev, next);
+        /*  进程之间上下文切换    */
+        rq = context_switch(rq, prev, next); /* unlocks the rq */
+    }
+    else    /*  如果prev和next为同一进程，则不进行进程切换  */
+    {
+        lockdep_unpin_lock(&rq->lock);
+        raw_spin_unlock_irq(&rq->lock);
+    }
+
+    balance_callback(rq);
+}
+STACK_FRAME_NON_STANDARD(__schedule); /* switch_to() */
+
+/*转载自： http://blog.csdn.net/gatieme*/
+
+/* 进程地址空间切换详解 */
+kstat.context_swtch++;	//	统计上下文切换的次数
+{
+  struct mm_struct *mm = next -> mm;
+  struct mm_struct *oldmm = prev -> active_mm;
+  if(!mm){		//	没有用户空间，表明这为内核线程
+    if(next->active_mm==NULL)BUG();
+    nexit->active_mm=oldmm;
+  }else{			//	一般进程则切换到这段用户空间
+    if(next->active_mm!=mm)BUG();
+    switch_mm(oldmm,mm,next,this_cpu);
+  }
+  if(!prev->mm){		//	切换出去的是内核线程的处理方式
+    prev->active_mm=NULL;
+    mmdrop(oldmm);
+  }
+}
+
+```
+
+Linux schedule()分析：
+
+1. 进程需要有自己的地址空间，或者和其他进程借用，如果都没有则出错，且如果`schedule()`在中断服务程序内部执行也出错
+2. 对当前进程要做相关的处理，应当进入调度程序是，其状态不一定还是`TASK_RUNNNING`
+3. 进程地址空间切换，如果新进程有自己的用户空间，则`switch_mm()`函数会把该进程从内核空间转换到用户空间（加载下一个要执行的进程的页目录）；如果新进程是一个内核线程，无用户空间而在内核空间中运行，则要借用前一个进程的地址空间，因为所有的进程的内核空间都是共享的。如果切换出去的如果是内核线程，则要归还所借用的地址空间，并把mm_struct 中的共享计数减1
+
+### Linux进程创建、线程及其创建
+
+Linux创建进程的方式是通过`fork()`或者`clone()`，然后再调用`exec()`，其使用的是写时复制技术（把父子进程的全部资源都设为只读，在父子进程尝试对其进行修改时才将被修改前的全部资源复制给子进程），创建进程的实际花销是为其创建PCB并把父进程的页表拷贝一份，如果进程中包含线程，则所有线程共享这些资源，无须拷贝。子进程一开始处于深度睡眠态，以确保它不会立刻运行，在把进程PCB插入到进程链表和哈希表后才将其设成就绪态，并让其平分父进程剩余的时间片，内核有意让子进程先执行，是为了让子进程使用`exec()`去执行其自己的代码，避免父进程操作引起写时复制，提高系统运行速度
+
+Linux把线程看成一个使用某些共享资源的进程，每个线程有唯一的PCB，一般情况下内核线程会在创建时永远地执行下去，在需要的时候就会被唤醒和执行。
+
+1. 进程0：内核初始化工作的`start_kernel()`创建一个内核线程也就是进程0，其PCB就是`init_task`
+2. 进程1：也就是init进程，其一开始是一个内核线程，其调用了`execve()`装入了用户态下可执行程序init(/sbin/init)，因此init是内核线程启动起来的一个普通进程，也就是用户态下的第一个进程
 
 ## 第四章 内存管理
 
